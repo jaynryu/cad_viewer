@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::{mpsc, Arc};
 
 use egui::{Response, Sense, Ui};
 
@@ -7,64 +8,118 @@ use crate::cad::selection::find_entity_at;
 use crate::cad::snap::{find_snap, SnapKind, SnapPoint};
 use crate::render::camera::Camera2D;
 use crate::render::pipeline::{CadPaintCallback, CadRenderResources, CameraUniform};
-use crate::render::tessellator::tessellate_all;
+use crate::render::tessellator::{
+    tessellate_owned_items, CellCache, OwnedRenderItem, RenderOutput,
+};
 
 /// State for the two-point distance measurement tool.
 #[derive(Clone, Debug, Default)]
 pub enum MeasureState {
     #[default]
     Idle,
-    /// First point picked, waiting for second point.
     FirstPicked([f64; 2]),
-    /// Both points picked — shows result until reset.
     Done([f64; 2], [f64; 2]),
+}
+
+/// Result delivered from the background tessellation thread.
+struct BackgroundTessResult {
+    /// Tessellation output for GPU upload (Arc avoids copying).
+    output: Arc<RenderOutput>,
+    /// Cell cache returned so the main thread can persist entries across frames.
+    cell_cache: CellCache,
+    tess_origin: [f64; 2],
+    tess_viewport: BoundingBox,
 }
 
 pub struct Viewport {
     pub camera: Camera2D,
-    dirty: bool,
-    last_zoom: f64,
-    /// Deferred fit: apply on first frame when viewport size is known
+
+    /// True when geometry must be re-tessellated (new file, layer toggle, etc.).
+    needs_tessellation: bool,
+    /// Last zoom level used for tessellation (for LOD rebuild decision).
+    last_tess_zoom: f64,
+    /// Latest tessellation output; sent to CadPaintCallback when ready.
+    pending_output: Option<Arc<RenderOutput>>,
+    /// Receiver for the background tessellation thread result. None when idle.
+    tess_rx: Option<mpsc::Receiver<BackgroundTessResult>>,
+
+    /// Deferred fit: apply on first frame when viewport size is known.
     pending_fit: Option<BoundingBox>,
-    /// Layer names that are hidden
     pub hidden_layers: HashSet<String>,
-    /// Index of the currently selected entity (if any)
     pub selected: Option<usize>,
-    /// Measurement tool state
     pub measure: MeasureState,
-    /// When true, clicks go to the measure tool instead of entity selection
     pub measure_mode: bool,
-    /// Current snap point (updated each frame in measure mode)
     snap_point: Option<SnapPoint>,
+    /// When false, polygons (GDS BOUNDARY) are drawn as outlines only.
+    pub fill_polygons: bool,
+    /// Pre-tessellated primitive geometry per GDS cell (earcut runs once per cell).
+    /// Cleared when a new file is loaded; entries accumulate across zoom/pan.
+    gds_cell_cache: CellCache,
+    /// World-space origin subtracted from vertex positions at tessellation time.
+    tess_origin: [f64; 2],
+    /// World-space bounding box used for viewport culling during the last tessellation.
+    /// When the camera moves outside this box, re-tessellation is triggered.
+    tess_viewport: BoundingBox,
+    /// Signal to the GPU: discard all cell geometry buffers (new file loaded).
+    clear_cell_geom: bool,
 }
 
 impl Viewport {
-    /// Initialize and register CadRenderResources into egui_wgpu's CallbackResources.
     pub fn new(wgpu_state: &eframe::egui_wgpu::RenderState) -> Self {
         let resources = CadRenderResources::new(&wgpu_state.device, wgpu_state.target_format);
-        wgpu_state.renderer.write().callback_resources.insert(resources);
+        wgpu_state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(resources);
 
         Self {
             camera: Camera2D::default(),
-            dirty: true,
-            last_zoom: 0.0,
+            needs_tessellation: true,
+            last_tess_zoom: 0.0,
+            pending_output: None,
+            tess_rx: None,
             pending_fit: None,
             hidden_layers: HashSet::new(),
             selected: None,
             measure: MeasureState::Idle,
             measure_mode: false,
             snap_point: None,
+            fill_polygons: true,
+            gds_cell_cache: CellCache::new(),
+            tess_origin: [0.0, 0.0],
+            tess_viewport: BoundingBox::empty(),
+            clear_cell_geom: false,
         }
     }
 
+    /// Signal that geometry has changed and full re-tessellation is needed.
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
+        self.needs_tessellation = true;
     }
 
-    /// Schedule a fit-to-bounds on the next frame (when viewport size is known).
+    /// Called when the layer visibility set changes.
+    /// Clears the GDS cell cache (CPU + GPU) so cells are rebuilt with the new layer filter.
+    pub fn mark_layers_changed(&mut self) {
+        self.gds_cell_cache.clear();
+        self.clear_cell_geom = true;
+        self.needs_tessellation = true;
+    }
+
+    /// Discard the GDS cell primitive cache (call when a new file is loaded).
+    /// Also cancels any in-flight background tessellation for the previous file.
+    pub fn reset_cell_cache(&mut self) {
+        self.gds_cell_cache.clear();
+        self.pending_output = None;
+        // Drop the receiver — the background thread will see a closed channel and exit.
+        self.tess_rx = None;
+        // Signal the GPU to discard stale cell geometry from the previous file.
+        self.clear_cell_geom = true;
+    }
+
     pub fn request_fit(&mut self, bounds: BoundingBox) {
         self.pending_fit = Some(bounds);
-        self.dirty = true;
+        self.needs_tessellation = true;
     }
 
     pub fn show(&mut self, ui: &mut Ui, drawing: Option<&Drawing>) {
@@ -77,14 +132,14 @@ impl Viewport {
         if available.width() > 10.0 && available.height() > 10.0 {
             if let Some(bounds) = self.pending_fit.take() {
                 self.camera.fit_to_bounds(&bounds);
-                self.dirty = true;
+                self.needs_tessellation = true;
                 ui.ctx().request_repaint();
             }
         }
 
-        // Compute snap point each frame when in measure mode
+        // Snap computation (measure mode only)
         if self.measure_mode {
-            let snap_tol = 15.0 / self.camera.zoom as f64;
+            let snap_tol = 15.0 / self.camera.zoom;
             let hover_world = ui.input(|i| i.pointer.hover_pos()).and_then(|pos| {
                 if available.contains(pos) {
                     let local = [pos.x - available.min.x, pos.y - available.min.y];
@@ -94,9 +149,7 @@ impl Viewport {
                 }
             });
             self.snap_point = hover_world.and_then(|w| {
-                drawing.and_then(|d| {
-                    find_snap(&d.entities, &d.entity_bounds, w, snap_tol)
-                })
+                drawing.and_then(|d| find_snap(&d.entities, &d.entity_bounds, w, snap_tol))
             });
             if self.snap_point.is_some() {
                 ui.ctx().request_repaint();
@@ -107,53 +160,139 @@ impl Viewport {
 
         self.handle_input(ui, &response, drawing);
 
-        // Check if we need to rebuild vertices (new file or significant zoom change)
-        let zoom_changed = if self.last_zoom > 1e-10 {
-            (self.camera.zoom - self.last_zoom).abs() / self.last_zoom > 0.5
-        } else {
-            true
-        };
-
-        let needs_rebuild = self.dirty || zoom_changed;
-        if needs_rebuild {
-            self.dirty = false;
-            self.last_zoom = self.camera.zoom;
+        // ── Viewport-change culling ───────────────────────────────────────────
+        {
+            let current_vp = self.camera.viewport_world_bounds(0.0);
+            if !self.tess_viewport.contains_bounds(&current_vp) {
+                self.needs_tessellation = true;
+            }
         }
 
-        // Build vertex data each frame when needed
-        let vertices = if needs_rebuild {
+        // ── Precision-driven retessellation ──────────────────────────────────
+        {
+            let max_offset = (self.camera.center[0] - self.tess_origin[0])
+                .abs()
+                .max((self.camera.center[1] - self.tess_origin[1]).abs());
+            let f32_precision = max_offset * 1.192e-7;
+            let pixel_world = 1.0 / self.camera.zoom.max(1e-30);
+            if f32_precision > pixel_world * 0.1 {
+                self.needs_tessellation = true;
+            }
+        }
+
+        // ── LOD-driven retessellation ─────────────────────────────────────────
+        if self.camera.zoom > self.last_tess_zoom * 2.0
+            || self.camera.zoom < self.last_tess_zoom * 0.5
+        {
+            self.needs_tessellation = true;
+        }
+
+        // ── Poll background tessellation result ───────────────────────────────
+        let mut upload_geometry = false;
+        if let Some(rx) = &self.tess_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.gds_cell_cache = result.cell_cache;
+                    self.pending_output = Some(result.output);
+                    self.tess_origin = result.tess_origin;
+                    self.tess_viewport = result.tess_viewport;
+                    self.tess_rx = None;
+                    upload_geometry = true;
+                    // Re-check if camera has moved significantly while tessellation ran.
+                    let current_vp = self.camera.viewport_world_bounds(0.0);
+                    if !self.tess_viewport.contains_bounds(&current_vp) {
+                        self.needs_tessellation = true;
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.tess_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Still running — keep showing existing GPU content.
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        // ── Spawn background tessellation if needed ───────────────────────────
+        if self.needs_tessellation && self.tess_rx.is_none() {
+            self.needs_tessellation = false;
+            self.last_tess_zoom = self.camera.zoom;
+
             match drawing {
                 Some(d) => {
-                    let vp_bounds = self.camera.viewport_world_bounds(0.1);
-                    tessellate_all(
-                        &d.entities,
-                        &d.entity_bounds,
-                        self.camera.zoom,
-                        &self.hidden_layers,
-                        Some(&vp_bounds),
-                    )
+                    let origin = self.camera.center;
+                    let tess_viewport = self.camera.viewport_world_bounds(1.0);
+                    let zoom = self.camera.zoom;
+                    let fill_polygons = self.fill_polygons;
+
+                    let items: Vec<OwnedRenderItem> = d
+                        .query_render_items(&tess_viewport, zoom, &self.hidden_layers)
+                        .iter()
+                        .map(OwnedRenderItem::from_render_item)
+                        .collect();
+
+                    let cache = std::mem::take(&mut self.gds_cell_cache);
+                    let gds_cells = Arc::clone(&d.gds_cells);
+                    let hidden_layers = self.hidden_layers.clone();
+
+                    let (tx, rx) = mpsc::channel();
+                    self.tess_rx = Some(rx);
+                    let ctx = ui.ctx().clone();
+
+                    std::thread::spawn(move || {
+                        let hidden = hidden_layers.clone();
+                        let mut output = tessellate_owned_items(
+                            items,
+                            zoom,
+                            origin,
+                            fill_polygons,
+                            &gds_cells,
+                            cache,
+                            Some(&tess_viewport),
+                            &hidden,
+                        );
+                        // Extract the cell cache before Arc-wrapping the output.
+                        let cell_cache = std::mem::take(&mut output.cell_cache);
+                        let result = BackgroundTessResult {
+                            output: Arc::new(output),
+                            cell_cache,
+                            tess_origin: origin,
+                            tess_viewport,
+                        };
+                        let _ = tx.send(result);
+                        ctx.request_repaint();
+                    });
                 }
-                None => vec![],
+                None => {
+                    self.pending_output = None;
+                    upload_geometry = true;
+                }
             }
-        } else {
-            vec![]
-        };
+        }
 
         let camera_uniform = CameraUniform {
-            view_proj: self.camera.view_projection_matrix(),
+            view_proj: self.camera.view_projection_matrix(self.tess_origin),
         };
+
+        let clear_cells = self.clear_cell_geom;
+        self.clear_cell_geom = false;
 
         let callback = eframe::egui_wgpu::Callback::new_paint_callback(
             available,
             CadPaintCallback {
-                vertices,
+                render_output: if upload_geometry {
+                    self.pending_output.clone()
+                } else {
+                    None
+                },
                 camera_uniform,
-                needs_rebuild,
+                needs_rebuild: upload_geometry,
+                clear_cells,
             },
         );
         ui.painter().add(callback);
 
-        // Placeholder text when no file is loaded
         if drawing.is_none() {
             ui.painter().text(
                 available.center(),
@@ -164,10 +303,9 @@ impl Viewport {
             );
         }
 
-        // Draw measure overlay
         self.draw_measure_overlay(ui, &response, drawing);
 
-        // Show cursor crosshair in measure mode
+        // Measure mode crosshair cursor
         if self.measure_mode {
             if let Some(hover) = ui.input(|i| i.pointer.hover_pos()) {
                 if available.contains(hover) {
@@ -254,16 +392,14 @@ impl Viewport {
             );
         };
 
-        // Draw snap indicator at current snap point
         if let Some(sp) = &self.snap_point {
-            self.draw_snap_indicator(&painter, sp, rect);
+            self.draw_snap_indicator(painter, sp, rect);
         }
 
         match &self.measure {
             MeasureState::Idle => {}
             MeasureState::FirstPicked(a) => {
                 draw_point(*a);
-                // Rubber-band to snap point or cursor
                 let world_b = if let Some(sp) = &self.snap_point {
                     Some(sp.world)
                 } else {
@@ -295,26 +431,21 @@ impl Viewport {
         let snap_color = egui::Color32::from_rgb(0, 220, 255);
         let stroke = egui::Stroke::new(2.0, snap_color);
         let size = 8.0f32;
-
         match sp.kind {
             SnapKind::Endpoint => {
-                // Square □
-                let half = size;
                 painter.rect_stroke(
-                    egui::Rect::from_center_size(pos, egui::vec2(half * 2.0, half * 2.0)),
+                    egui::Rect::from_center_size(pos, egui::vec2(size * 2.0, size * 2.0)),
                     0.0,
                     stroke,
                 );
             }
             SnapKind::Center => {
-                // Circle with crosshair ⊕
                 painter.circle_stroke(pos, size, stroke);
                 let s = size * 0.6;
                 painter.line_segment([pos - egui::vec2(s, 0.0), pos + egui::vec2(s, 0.0)], stroke);
                 painter.line_segment([pos - egui::vec2(0.0, s), pos + egui::vec2(0.0, s)], stroke);
             }
             SnapKind::Midpoint => {
-                // Triangle △
                 let h = size * 1.2;
                 let w = size;
                 let pts = [
@@ -338,7 +469,7 @@ impl Viewport {
             }
         }
 
-        // Pan: middle-mouse drag, or left drag (only when not in measure mode)
+        // Pan: middle-mouse drag, or left drag (not in measure mode)
         let is_dragging = response.dragged_by(egui::PointerButton::Middle)
             || (!self.measure_mode && response.dragged_by(egui::PointerButton::Primary));
         if is_dragging {
@@ -346,7 +477,7 @@ impl Viewport {
             self.camera.pan([delta.x, delta.y]);
         }
 
-        // Click handling
+        // Click: measure or entity selection
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let origin = response.rect.min;
@@ -354,13 +485,7 @@ impl Viewport {
                 let world = self.camera.screen_to_world(local);
 
                 if self.measure_mode {
-                    // Use snapped position if available
-                    let pick = if let Some(sp) = &self.snap_point {
-                        sp.world
-                    } else {
-                        world
-                    };
-                    // Measure tool click
+                    let pick = self.snap_point.as_ref().map(|sp| sp.world).unwrap_or(world);
                     match self.measure {
                         MeasureState::Idle | MeasureState::Done(_, _) => {
                             self.measure = MeasureState::FirstPicked(pick);
@@ -369,17 +494,9 @@ impl Viewport {
                             self.measure = MeasureState::Done(a, pick);
                         }
                     }
-                } else {
-                    // Entity selection click
-                    if let Some(d) = drawing {
-                        let tolerance = 5.0 / self.camera.zoom;
-                        self.selected = find_entity_at(
-                            &d.entities,
-                            &d.entity_bounds,
-                            world,
-                            tolerance,
-                        );
-                    }
+                } else if let Some(d) = drawing {
+                    let tolerance = 5.0 / self.camera.zoom;
+                    self.selected = find_entity_at(&d.entities, &d.entity_bounds, world, tolerance);
                 }
             }
         }
@@ -392,7 +509,6 @@ impl Viewport {
             let local_pos = [pos.x - origin.x, pos.y - origin.y];
             let factor = (1.0_f64 + scroll as f64 * 0.003).clamp(0.5, 2.0);
             self.camera.zoom_at(local_pos, factor);
-            self.dirty = true;
         }
 
         // F key: fit to bounds
@@ -400,7 +516,7 @@ impl Viewport {
             if let Some(d) = drawing {
                 if let Some(bounds) = &d.bounds {
                     self.camera.fit_to_bounds(bounds);
-                    self.dirty = true;
+                    self.needs_tessellation = true;
                 }
             }
         }

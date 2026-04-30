@@ -78,6 +78,36 @@ fn entity_dist(entity: &CadEntity, p: [f64; 2]) -> f64 {
                 .fold(f64::MAX, f64::min)
         }
         CadEntity::Text(e) => dist(p, e.position),
+        CadEntity::Polygon(e) => {
+            let n = e.points.len();
+            if n < 2 {
+                return f64::MAX;
+            }
+            (0..n.saturating_sub(1))
+                .map(|i| segment_dist(p, e.points[i], e.points[(i + 1) % n]))
+                .fold(f64::MAX, f64::min)
+        }
+        CadEntity::GdsInstance(e) => {
+            if e.bbox.is_valid() {
+                dist(p, e.bbox.center())
+            } else {
+                f64::MAX
+            }
+        }
+        CadEntity::GdsArrayInstance(e) => {
+            if e.bbox.is_valid() {
+                dist(p, e.bbox.center())
+            } else {
+                f64::MAX
+            }
+        }
+        CadEntity::DxfInsert(e) => {
+            if e.bbox.is_valid() {
+                dist(p, e.bbox.center())
+            } else {
+                f64::MAX
+            }
+        }
     }
 }
 
@@ -109,7 +139,11 @@ fn angle_in_arc(angle: f64, start: f64, end: f64) -> bool {
     a = ((a % TAU) + TAU) % TAU;
     s = ((s % TAU) + TAU) % TAU;
     e = ((e % TAU) + TAU) % TAU;
-    if e <= s { e += TAU; }
-    if a < s { a += TAU; }
+    if e <= s {
+        e += TAU;
+    }
+    if a < s {
+        a += TAU;
+    }
     a <= e
 }

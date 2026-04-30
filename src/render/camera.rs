@@ -42,30 +42,35 @@ impl Camera2D {
     }
 
     /// Build an orthographic projection matrix (column-major, for wgpu NDC).
-    /// Maps world coords → NDC [-1, 1].
-    pub fn view_projection_matrix(&self) -> [[f32; 4]; 4] {
+    ///
+    /// `tess_origin` is the world-space point that was subtracted from all
+    /// vertex positions at tessellation time. Pass the same value here so that
+    /// the translation stays a small number (camera_center − tess_origin) and
+    /// f32 precision is preserved even for very large coordinate values.
+    pub fn view_projection_matrix(&self, tess_origin: [f64; 2]) -> [[f32; 4]; 4] {
         let vw = self.viewport_size[0] as f64;
         let vh = self.viewport_size[1] as f64;
 
-        // Scale factors: world unit → NDC unit
         let sx = (2.0 * self.zoom / vw) as f32;
         let sy = (2.0 * self.zoom / vh) as f32;
 
-        // Translation: center → NDC origin  (both must be negative)
-        let tx = (-self.center[0] * 2.0 * self.zoom / vw) as f32;
-        let ty = (-self.center[1] * 2.0 * self.zoom / vh) as f32;
+        // Translate by (center − tess_origin): both are large but their
+        // difference is small, so the cast to f32 stays precise.
+        let rel_x = self.center[0] - tess_origin[0];
+        let rel_y = self.center[1] - tess_origin[1];
+        let tx = (-rel_x * 2.0 * self.zoom / vw) as f32;
+        let ty = (-rel_y * 2.0 * self.zoom / vh) as f32;
 
-        // Column-major 4x4 orthographic matrix
-        // (row 0, row 1, row 2, row 3) stored as columns
         [
-            [sx,  0.0, 0.0, 0.0],
-            [0.0, sy,  0.0, 0.0],
+            [sx, 0.0, 0.0, 0.0],
+            [0.0, sy, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
-            [tx,  ty,  0.0, 1.0],
+            [tx, ty, 0.0, 1.0],
         ]
     }
 
-    /// Return the world-space bounding box of the current viewport, with an optional margin factor.
+    /// Return the world-space bounding box of the current viewport.
+    /// `margin` expands the box: 0.0 = exact viewport, 1.0 = 2× size (100% margin each side).
     pub fn viewport_world_bounds(&self, margin: f64) -> BoundingBox {
         let hw = self.viewport_size[0] as f64 * 0.5 / self.zoom * (1.0 + margin);
         let hh = self.viewport_size[1] as f64 * 0.5 / self.zoom * (1.0 + margin);

@@ -42,7 +42,7 @@ pub fn find_snap(
             };
             // Compare: lower priority wins, then closer distance
             let score = priority * tolerance * 2.0 + d;
-            if best.as_ref().map_or(true, |(s, _)| score < *s) {
+            if best.as_ref().is_none_or(|(s, _)| score < *s) {
                 best = Some((score, SnapPoint { world, kind }));
             }
         }
@@ -70,24 +70,38 @@ fn collect_snap_candidates(entity: &CadEntity, cb: &mut impl FnMut([f64; 2], Sna
             // 4 quadrant points
             for i in 0..4 {
                 let a = TAU * i as f64 / 4.0;
-                cb([c.center[0] + c.radius * a.cos(), c.center[1] + c.radius * a.sin()], SnapKind::Endpoint);
+                cb(
+                    [
+                        c.center[0] + c.radius * a.cos(),
+                        c.center[1] + c.radius * a.sin(),
+                    ],
+                    SnapKind::Endpoint,
+                );
             }
         }
         CadEntity::Arc(a) => {
             cb(a.center, SnapKind::Center);
             // Start and end points of arc
             cb(
-                [a.center[0] + a.radius * a.start_angle.cos(), a.center[1] + a.radius * a.start_angle.sin()],
+                [
+                    a.center[0] + a.radius * a.start_angle.cos(),
+                    a.center[1] + a.radius * a.start_angle.sin(),
+                ],
                 SnapKind::Endpoint,
             );
             cb(
-                [a.center[0] + a.radius * a.end_angle.cos(), a.center[1] + a.radius * a.end_angle.sin()],
+                [
+                    a.center[0] + a.radius * a.end_angle.cos(),
+                    a.center[1] + a.radius * a.end_angle.sin(),
+                ],
                 SnapKind::Endpoint,
             );
         }
         CadEntity::Polyline(p) => {
             let n = p.points.len();
-            if n == 0 { return; }
+            if n == 0 {
+                return;
+            }
             for &pt in &p.points {
                 cb(pt, SnapKind::Endpoint);
             }
@@ -112,6 +126,23 @@ fn collect_snap_candidates(entity: &CadEntity, cb: &mut impl FnMut([f64; 2], Sna
         }
         CadEntity::Text(t) => {
             cb(t.position, SnapKind::Endpoint);
+        }
+        CadEntity::Polygon(p) => {
+            let n = p.points.len();
+            for &pt in &p.points {
+                cb(pt, SnapKind::Endpoint);
+            }
+            let seg_count = if n > 1 && p.points[0] == p.points[n - 1] {
+                n - 1
+            } else {
+                n
+            };
+            for i in 0..seg_count.saturating_sub(1) {
+                cb(midpoint(p.points[i], p.points[i + 1]), SnapKind::Midpoint);
+            }
+        }
+        CadEntity::GdsInstance(_) | CadEntity::GdsArrayInstance(_) | CadEntity::DxfInsert(_) => {
+            // No snap candidates for cell instance references.
         }
     }
 }
